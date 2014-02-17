@@ -1,0 +1,226 @@
+#!/bin/bash
+#
+# zfs/zrep OCF RA.
+#
+# Copyright (c) 2014 Olivier Le Cam <olc@glou.fr>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write the Free Software Foundation,
+# Inc., 59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+#
+
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+#######################################################################
+
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="zrep" version="0.9">
+<version>1.0</version>
+
+<longdesc lang="en">
+This script manage zrep for an active/passive cluster.
+It manages failover/takeover.
+</longdesc>
+<shortdesc lang="en">Manage zrep for a two-nodes replicated active/passive datasets.</shortdesc>
+
+<parameters>
+<parameter name="dataset" unique="1">
+<longdesc lang="en">
+The dataset path (example: tank/store)
+</longdesc>
+<shortdesc lang="en">dataset</shortdesc>
+<content type="string" default="" />
+</parameter>
+</parameters>
+
+<actions>
+<action name="start"        timeout="20" />
+<action name="stop"         timeout="20" />
+<action name="monitor"      timeout="20" interval="10" depth="0" />
+<action name="reload"       timeout="20" />
+<action name="migrate_to"   timeout="20" />
+<action name="migrate_from" timeout="20" />
+<action name="meta-data"    timeout="5" />
+<action name="validate-all"   timeout="20" />
+</actions>
+</resource-agent>
+END
+}
+
+#######################################################################
+
+zrep_usage () {
+	cat <<END
+usage: $0 {start|stop|monitor|status|migrate_to|migrate_from|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+}
+
+zrep_dataset_exists () {
+	zfs list -H "$OCF_RESKEY_dataset" >/dev/null
+}
+
+zrep_start () {
+    zrep_monitor ; RC=$?
+
+    case $RC in
+        $OCF_SUCCESS)
+            ocf_log info "[zrep_start] The node is already in active mode."
+            return $OCF_SUCCESS
+            ;;
+        $OCF_ERR_GENERIC)
+            ocf_log err "[zrep_start] Dataset '$OCF_RESKEY_dataset' is not ready."
+            return $OCF_ERR_GENERIC
+            ;;
+    esac
+
+    if zrep takeover -L $OCF_RESKEY_dataset ; then
+        ocf_log debug "[zrep_start] Takeover to $OCF_RESKEY_dataset complete."
+        return $OCF_SUCCESS
+    else
+        ocf_log err "[zrep_start] Could not takeover for $OCF_RESKEY_dataset"
+        return $OCF_ERR_GENERIC
+    fi
+}
+
+zrep_stop () {
+    zrep_monitor ; RC=$?
+
+    case $RC in
+        $OCF_SUCCESS)
+            ;;
+        $OCF_NOT_RUNNING)
+            ocf_log err "[zrep_stop] Dataset '$OCF_RESKEY_dataset' already stopped."
+            return $OCF_SUCCESS
+            ;;
+        *)
+            ocf_log err "[zrep_stop]Dataset '$OCF_RESKEY_dataset' not ready."
+            return $OCF_ERR_GENERIC
+            ;;
+    esac
+
+    # Failover might be locked if a zrep sync is currently in use, so it is necessary to take
+    # care on that.
+    # That should not occur in case of an automatic failover (disaster recovery)
+    # but only if the sysop manually toggles the active server.
+    RETRIES=10
+
+    for i in {1..$RETRIES} ; do
+        sync ; sync ; sync
+
+        if ! zrep -S $OCF_RESKEY_dataset ; then
+            MSG="Could not synchronize dataset '$OCF_RESKEY_dataset' to the remote passive node."
+        elif ! zrep failover -L $OCF_RESKEY_dataset ; then
+            MSG="Could not failover dataset '$OCF_RESKEY_dataset' to the remote passive node."
+        else
+            ocf_log debug "[zrep_stop] Failover to $OCF_RESKEY_dataset complete."
+            return $OCF_SUCCESS
+        fi
+
+        ocf_log err "[zrep_stop] $MSG"
+
+        if [ $i -lt $RETRIES ] ; then
+            ocf_log err "Retrying..."
+            sleep 1
+        fi
+    done
+
+    ocf_log err "[zrep_stop] Too many errors: aborting."
+    return $OCF_ERR_GENERIC
+}
+
+zrep_monitor () {
+    if ! zrep_dataset_exists ; then
+        ocf_log err "[zrep_monitor] Dataset '$OCF_RESKEY_dataset' does not exist."
+        return $OCF_ERR_GENERIC
+    fi
+
+    if ! zrep status $OCF_RESKEY_dataset >/dev/null 2>&1 ; then
+        ocf_log err "[zrep_monitor] The dataset '$OCF_RESKEY_dataset' is not under zrep control."
+        return $OCF_ERR_GENERIC
+    fi
+
+    if [ $(zrep status |egrep "^$OCF_RESKEY_dataset " |wc -l) -eq 0 ] ; then
+        ocf_log info "[zrep_monitor] state=not_running, node is in passive mode."
+        return $OCF_NOT_RUNNING
+    else
+        RESULT=$(zfs get -H -o value readonly "$OCF_RESKEY_dataset") ; RC=$?
+        if [ $RC -ne 0 ] || [ "$RESULT" != "off" ] ; then
+            ocf_log err "[zrep_monitor] state=error, node claims to be active but dataset is ready-only."
+            return $OCF_ERR_GENERIC
+        fi
+        ocf_log info "[zrep_monitor] state=running, node is in active mode."
+        return $OCF_SUCCESS
+    fi
+}
+
+zrep_validate () {
+    if ! which  >/dev/null 2>&1 ; then
+        ocf_log debug "[zrep_validate] The 'zrep' command not available"
+        return $OCF_ERR_INSTALLED
+    fi
+
+    if [ -z "$OCF_RESKEY_dataset" ] ; then
+        ocf_log err "[zrep_validate] Missing required parameter 'dataset'."
+        exit $OCF_ERR_CONFIGURED
+    fi
+
+    if ! zrep_dataset_exists ; then
+        ocf_log debug "[zrep_validate] Dataset '$OCF_RESKEY_dataset' does not exist"
+        return $OCF_ERR_CONFIGURED
+    fi
+
+    return $OCF_SUCCESS
+}
+
+ocf_log debug "********** $__OCF_ACTION"
+
+case $__OCF_ACTION in
+    meta-data)      meta_data
+                    exit $OCF_SUCCESS
+                    ;;
+    start)          zrep_start;;
+    stop)           zrep_stop;;
+    status|monitor) zrep_monitor;;
+    migrate_to)     ocf_log info "Migrating ${OCF_RESOURCE_INSTANCE} to ${OCF_RESKEY_CRM_meta_migrate_target}."
+                    zrep_stop
+                    ;;
+    migrate_from)   ocf_log info "Migrating ${OCF_RESOURCE_INSTANCE} from ${OCF_RESKEY_CRM_meta_migrate_source}."
+                    zrep_start
+                    ;;
+    reload)         ;;
+    validate-all)   zrep_validate;;
+    usage|help)     zrep_usage
+                    exit $OCF_SUCCESS
+                    ;;
+    *)              zrep_usage
+                    exit $OCF_ERR_UNIMPLEMENTED
+                    ;;
+esac
+rc=$?
+ocf_log debug "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION : $rc"
+exit $rc
+

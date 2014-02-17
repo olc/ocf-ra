@@ -1,0 +1,209 @@
+#!/bin/bash
+#
+#	ZFS/sharenfs OCF RA.
+#
+# Copyright (c) 2014 Olivier Le Cam <olc@glou.fr>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write the Free Software Foundation,
+# Inc., 59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+#
+
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+#######################################################################
+
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="sharenfs" version="0.9">
+<version>1.0</version>
+
+<longdesc lang="en">
+This script manage sharenfs fot zfs.
+It can share or unshare datasets.
+</longdesc>
+<shortdesc lang="en">Manage dataset's sharenfs options</shortdesc>
+
+<parameters>
+<parameter name="dataset" unique="1">
+<longdesc lang="en">
+The dataset path (example: tank/store)
+</longdesc>
+<shortdesc lang="en">dataset</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="options" unique="0">
+<longdesc lang="en">
+Sharenfs options (example: anon=0,rw=@172.31.0.0/16,root=@172.31.0.0/16)
+</longdesc>
+<shortdesc lang="en">options</shortdesc>
+<content type="string" default="dummy" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"        timeout="20" />
+<action name="stop"         timeout="20" />
+<action name="monitor"      timeout="20" interval="10" depth="0" />
+<action name="reload"       timeout="20" />
+<action name="migrate_to"   timeout="20" />
+<action name="migrate_from" timeout="20" />
+<action name="meta-data"    timeout="5" />
+<action name="validate-all"   timeout="20" />
+</actions>
+</resource-agent>
+END
+}
+
+#######################################################################
+
+sharenfs_usage () {
+	cat <<END
+usage: $0 {start|stop|monitor|status|reload|migrate_to|migrate_from|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+}
+
+sharenfs_dataset_exists () {
+	zfs list -H "$OCF_RESKEY_dataset" >/dev/null
+}
+
+sharenfs_start () {
+    if sharenfs_monitor ; then
+        ocf_log err "[sharenfs_start] Dataset '$OCF_RESKEY_dataset' is already shared."
+        return $OCF_ERR_GENERIC
+    fi
+
+    if zfs sharenfs="$OCF_RESKEY_options" "$OCF_RESKEY_dataset" ; then
+        ocf_log debug "[sharenfs_start] Sharing dataset '$OCF_RESKEY_dataset' with options '$OCF_RESKEY_options' successful."
+        return $OCF_SUCCESS
+    else
+        ocf_log debug "[sharenfs_start] Sharing dataset '$OCF_RESKEY_dataset' with options '$OCF_RESKEY_options' failed."
+        return $OCF_ERR_GENERIC
+    fi
+}
+
+sharenfs_stop () {
+    if ! sharenfs_monitor ; then
+        ocf_log debug "[sharenfs_stop] Dataset '$OCF_RESKEY_dataset' was not mounted."
+        return $OCF_SUCCESS
+    fi
+
+    if zfs sharenfs=off "$OCF_RESKEY_dataset" ; then
+        ocf_log debug "[sharenfs_stop] Unsharing dataset '$OCF_RESKEY_dataset' successful."
+        return $OCF_SUCCESS
+    else
+        ocf_log debug "[sharenfs_stop] Unsharing dataset '$OCF_RESKEY_dataset' failed."
+        return $OCF_ERR_GENERIC
+    fi
+}
+
+sharenfs_reload () {
+    if zfs sharenfs="$OCF_RESKEY_options" "$OCF_RESKEY_dataset" ; then
+        ocf_log debug "[sharenfs_reload] Sharing dataset '$OCF_RESKEY_dataset' with options '$OCF_RESKEY_options' successfully updated."
+        return $OCF_SUCCESS
+    else
+        ocf_log debug "[sharenfs_reload] Sharing dataset '$OCF_RESKEY_dataset' with options '$OCF_RESKEY_options' failed."
+        return $OCF_ERR_GENERIC
+    fi
+}
+
+sharenfs_monitor () {
+    # If the dataset does not exist, no way to monitor it!
+    if ! sharenfs_dataset_exists ; then
+        ocf_log debug "[sharenfs_monitor] Dataset '$OCF_RESKEY_dataset' does not exist."
+        return $OCF_ERR_GENERIC
+    fi
+
+    SHARENFS=$(zfs get -H -o value sharenfs $OCF_RESKEY_dataset)
+
+    if [ "$SHARENFS" = "off" ] ; then
+        ocf_log debug "[sharenfs_monitor] Dataset '$OCF_RESKEY_dataset' not shared."
+        return $OCF_NOT_RUNNING
+    fi
+
+    if showmount -e |egrep "^/$OCF_RESKEY_dataset " >/dev/null ; then
+        ocf_log debug "[sharenfs_monitor] Dataset '$OCF_RESKEY_dataset' is mounted."
+        return $OCF_SUCCESS
+    fi 
+
+    ocf_log debug "[sharenfs_monitor] Dataset '$OCF_RESKEY_dataset' has unexpected error."	
+    return $OCF_ERR_GENERIC
+}
+
+sharenfs_validate () {
+    if ! which zfs >/dev/null 2>&1 ; then
+        ocf_log debug "[sharenfs_validate] The 'zfs' command not available"
+        return $OCF_ERR_INSTALLED
+    fi
+
+    if [ -z "$OCF_RESKEY_dataset" ] ; then
+        ocf_log err "[sharenfs_validate] Missing required parameter 'dataset'."
+        return $OCF_ERR_CONFIGURED
+    fi
+
+    if [ -z "$OCF_RESKEY_options" ] ; then
+        ocf_log err "[sharenfs_validate] Missing required parameter 'options'."
+        exit $OCF_ERR_CONFIGURED
+    fi
+
+    if ! sharenfs_dataset_exists ; then
+        ocf_log debug "[sharenfs_validate] Dataset '$OCF_RESKEY_dataset' does not exist"
+        return $OCF_ERR_CONFIGURED
+    fi
+
+    return $OCF_SUCCESS
+}
+
+case $__OCF_ACTION in
+    meta-data)      meta_data
+                    exit $OCF_SUCCESS
+                    ;;
+    start)          sharenfs_start;;
+    stop)           sharenfs_stop;;
+    status|monitor) sharenfs_monitor;;
+    migrate_to)     ocf_log info "Migrating ${OCF_RESOURCE_INSTANCE} to ${OCF_RESKEY_CRM_meta_migrate_target}."
+                    sharenfs_stop
+                    ;;
+    migrate_from)   ocf_log info "Migrating ${OCF_RESOURCE_INSTANCE} from ${OCF_RESKEY_CRM_meta_migrate_source}."
+                    sharenfs_start
+                    ;;
+    reload)         ocf_log info "Reloading ${OCF_RESOURCE_INSTANCE} ..."
+                    sharenfs_reload
+                    ;;
+    validate-all)   sharenfs_validate;;
+    usage|help)     sharenfs_usage
+                    exit $OCF_SUCCESS
+                    ;;
+    *)              sharenfs_usage
+                    exit $OCF_ERR_UNIMPLEMENTED
+                    ;;
+esac
+rc=$?
+ocf_log debug "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION : $rc"
+exit $rc
+
